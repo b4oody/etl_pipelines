@@ -2,3 +2,4 @@ pandas>=2.0.0
 requests>=2.31.0
 psycopg2-binary>=2.9.0
 python-dotenv>=1.0.0
+pandera>=0.20.0

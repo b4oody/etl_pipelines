@@ -1,0 +1,116 @@
+# Локальний Airflow-стек для etl_project.
+# Окремий від твого docker-compose.yml (ETL Postgres) — піднімай їх незалежно.
+# Executor: LocalExecutor (одна машина, без Redis/Celery).
+# Metadata DB: власний Postgres (airflow-postgres), окремий від etl_db / currency.
+#
+# Запуск:
+#   docker compose -f docker-compose.airflow.yml --env-file .env.airflow up -d
+# UI: http://localhost:8081  (admin / пароль із .env.airflow)
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:3.2.2-python3.12
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+    # Спільний секрет для підпису внутрішніх JWT між task-runner і API-сервером.
+    # Має бути однаковим у ВСІХ контейнерах, інакше "Signature verification failed".
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_FERNET_KEY}
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+    # Airflow 3.x: task-runner спілкується з API-сервером по HTTP (Execution API).
+    # Без цього worker стукає в localhost:8080 і падає з Connection refused.
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    # Airflow 3 за замовчуванням використовує Simple Auth Manager (не FAB/ролі).
+    # Формат USERS: "username:role" (ролі: viewer/user/op/admin). Це НЕ пароль.
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: "${AIRFLOW_ADMIN_USER:-admin}:admin"
+    # Пароль SAM генерує сам і пише у цей файл (на томі — щоб був стабільним між рестартами).
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_PASSWORDS_FILE: /opt/airflow/.airflow-auth/simple_auth_manager_passwords.json.generated
+    # твій ETL-код доступний для import всередині DAG-ів
+    PYTHONPATH: /opt/airflow/include
+    # Дев-спосіб доставити pip-залежності без кастомного образу: контейнер
+    # ставить їх при старті. На ПРОДІ так НЕ роблять — там пакети печуть у
+    # Dockerfile (повільний старт + немає відтворюваності). Для локалки — ок.
+    _PIP_ADDITIONAL_REQUIREMENTS: "pandera>=0.20.0"
+    # Connection до твоєї БД курсів валют (host.docker.internal — твій Postgres на хості)
+    AIRFLOW_CONN_POSTGRES_CURRENCY: postgresql://etl_postgres_currency_user:etl_postgres_currency_password@host.docker.internal:5433/etl_postgres_currency
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - ./include:/opt/airflow/include
+    - ./.airflow-auth:/opt/airflow/.airflow-auth
+  user: "${AIRFLOW_UID:-50000}:0"
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  depends_on:
+    airflow-postgres:
+      condition: service_healthy
+
+services:
+  airflow-postgres:
+    image: postgres:16-alpine
+    container_name: airflow_metadata_db
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Одноразова ініціалізація: лише міграції metadata-БД.
+  # Користувач admin створюється автоматично Simple Auth Manager (env вище),
+  # пароль генерується у файл паролів на томі ./.airflow-auth.
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow_init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - airflow db migrate
+    restart: on-failure
+
+  airflow-apiserver:
+    <<: *airflow-common
+    container_name: airflow_apiserver
+    command: api-server
+    ports:
+      - "8081:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/version"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: always
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow_scheduler
+    command: scheduler
+    restart: always
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  # В Airflow 3.x парсинг файлів DAG винесено в окремий процес (не scheduler).
+  # Без нього DAG-и з папки dags/ не зʼявляються в UI.
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: airflow_dag_processor
+    command: dag-processor
+    restart: always
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  airflow_pg_data:
+    driver: local
